@@ -1,0 +1,383 @@
+module A9Syntax where
+
+import Text.ParserCombinators.ReadP
+import Debug.Trace
+import Data.List(unzip5, intercalate)
+import Control.Monad
+
+--
+-- Syntax, values and environments for L5
+--
+
+data Ty = IntTy
+        | BoolTy
+        | FunTy [Ty] Ty  -- [..] only for primitives
+        | PairTy Ty Ty
+        deriving (Eq, Show)
+
+data Exp = Var Id
+         | Int Integer
+         | TrueConst
+         | FalseConst
+         | Pair Exp Exp
+         | Fst Exp
+         | Snd Exp
+         | PrimitiveApp Primitive [Exp]
+         | If Exp Exp Exp
+         | Let Id Exp Exp
+         | Proc Ty Id Exp
+         | App Exp Exp
+         deriving (Eq, Show)
+
+data Primitive =
+  Add | Subtract | Mult | Succ | Pred | IsZero
+  deriving (Eq, Show)
+
+type Id = String
+
+data EVal = IntVal Integer
+          | BoolVal Bool
+          | ProcVal [Id] Exp Env
+          | PairVal EVal EVal
+          deriving (Eq, Show)
+
+primitiveTy :: Primitive -> Ty
+primitiveTy Add = FunTy [IntTy, IntTy] IntTy
+primitiveTy Subtract = FunTy [IntTy, IntTy] IntTy
+primitiveTy Mult = FunTy [IntTy, IntTy] IntTy
+primitiveTy Succ = FunTy [IntTy] IntTy
+primitiveTy Pred = FunTy [IntTy] IntTy
+primitiveTy IsZero = FunTy [IntTy] BoolTy
+                          
+class Pretty a where
+  pretty :: a -> String
+
+instance Pretty Exp where
+  pretty (Var x) = x
+  pretty (Int n) = show n
+  pretty TrueConst = "true"
+  pretty FalseConst = "false"
+  pretty (Pair e e') = tuple [pretty e, pretty e']
+  pretty (Fst e) = "fst" ++ parens (pretty e)
+  pretty (Snd e) = "snd" ++ parens (pretty e)
+  pretty (PrimitiveApp p es) =
+    case lookup p primitivesSyntax of
+     Just s -> s ++ tuple (map pretty es)
+     Nothing -> "?" ++ tuple (map pretty es)
+  pretty (If e et ef) =
+    "if" ++ tuple [pretty e, pretty et, pretty ef]
+  pretty (Let x e b) =
+    "let " ++ x ++ "=" ++ pretty e ++ " in " ++ pretty b
+  pretty (Proc ty x e) =
+    "%" ++ parens (pretty ty ++ " " ++ x) ++ pretty e
+  pretty (App f arg) =
+    parens (pretty f ++ " " ++ pretty arg)
+
+instance Pretty Ty where
+  pretty IntTy = "int"
+  pretty BoolTy = "bool"
+  pretty (FunTy argTys resTy) =
+    brackets $
+    intercalate "," (map pretty argTys)
+    ++ "->" ++ pretty resTy
+  pretty (PairTy ty ty') = tuple [pretty ty, pretty ty']
+  
+parens s = "(" ++ s ++ ")"
+brackets s = "[" ++ s ++ "]"
+tuple ss = parens $ intercalate "," ss
+
+--
+-- Parsing
+-- 
+
+primitivesSyntax =
+  [(Add, "+"),
+   (Subtract, "-"),
+   (Mult, "*"),
+   (Succ, "succ"),
+   (Pred, "pred"),
+   (IsZero, "iszero")
+  ]
+
+reservedWords =
+  [ "let"
+  , "in"
+  , "if"
+  , "true"
+  , "false"
+  , "succ"
+  , "pred"
+  , "iszero"
+  , "int"
+  , "bool"
+  ]
+
+  
+
+isAlpha :: Char -> Bool
+isAlpha = flip elem alphabet
+  where alphabet =
+          "_abcdefghijklmnopqrstuvwxyz" ++
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+isDigit = flip elem "0123456789"
+
+isAlphanum :: Char -> Bool
+isAlphanum c =  isAlpha c || isDigit c
+
+parenP :: ReadP a -> ReadP a
+parenP =
+  between
+  (symbolP "(")
+  (symbolP ")")
+
+brackP :: ReadP a -> ReadP a
+brackP =
+  between
+  (symbolP "[")
+  (symbolP "]")
+
+listP :: Char -> ReadP a -> ReadP [a]
+listP c p =
+  sepBy p (skipSpaces >> char c)
+  
+tupleP :: ReadP a -> ReadP [a]
+tupleP =
+  parenP . listP ','
+
+-- parse specified non numeric token, rejecting if the token is a
+-- proper prefix of an identifier.
+symbolP :: String -> ReadP ()
+symbolP s =
+  skipSpaces
+  >> if isAlpha (head s) then word else nonWord
+  where word = do w <- many $ satisfy isAlphanum
+                  rest <- look
+                  guard (rest == "" || not (isAlphanum (head rest)))
+                  guard (w == s)
+                  return ()
+        nonWord = string s >> return ()
+
+idP :: ReadP Id
+idP =
+  do skipSpaces
+     first <- satisfy isAlpha
+     rest <- munch isAlphanum
+     lookStr <- look
+     guard (lookStr == "" || not (isAlphanum (head lookStr)))
+     if (first:rest) `elem` reservedWords
+       then pfail
+       else return $ first:rest
+
+typedIdP :: ReadP (Ty, Id)
+typedIdP =
+  do ty <- typeP
+     id <- idP
+     return (ty,id)       
+
+varP :: ReadP Exp  
+varP =
+  do id <- idP
+     return $ Var id
+
+trueP :: ReadP Exp       
+trueP =
+  symbolP "true" >> return TrueConst
+
+falseP :: ReadP Exp  
+falseP =
+  symbolP "false" >> return FalseConst
+
+pairP :: ReadP Exp
+pairP =
+  parenP $
+  do one <- expP
+     symbolP ","
+     two <- expP
+     return $ Pair one two
+
+fstP :: ReadP Exp
+fstP =
+  do symbolP "fst"
+     e <- parenP expP
+     return $ Fst e
+
+sndP :: ReadP Exp
+sndP =
+  do symbolP "snd"
+     e <- parenP expP
+     return $ Snd e
+
+intP :: ReadP Exp
+intP =
+  do
+    skipSpaces
+    neg <- option 1 (char '-' >> return (-1))
+    num <- munch1 isDigit
+    return $ Int $ (*) neg $ (read num :: Integer)
+
+primitiveP :: ReadP Primitive
+primitiveP =
+  choice
+  $
+  map (\(op,s)-> symbolP s >> return op) primitivesSyntax
+
+primitiveAppP :: ReadP Exp
+primitiveAppP =    
+    do
+      p <- primitiveP
+      l <- tupleP expP
+      return (PrimitiveApp p l)
+
+ifP :: ReadP Exp      
+ifP = 
+    do symbolP "if"
+       [b,e1,e2] <- tupleP expP
+       return (If b e1 e2)
+
+letBindingP :: ReadP (Id, Exp)
+letBindingP =
+  do
+    id <- idP
+    symbolP "="
+    e <- expP
+    return (id,e)
+
+letP :: ReadP Exp
+letP =
+  do symbolP "let"
+     b <- letBindingP
+     symbolP "in"
+     body <- expP
+     let (id, rhs) = b
+     return $ Let id rhs body
+
+procP :: ReadP Exp
+procP =
+  do
+    symbolP "%"
+    typedParm <- parenP typedIdP
+    let (ty, parm) = typedParm
+    body <- expP
+    return $ Proc ty parm body
+       
+appP :: ReadP Exp
+appP =
+    parenP
+    $ do fn <- expP
+         arg <- expP
+         return $ App fn arg
+
+expP :: ReadP Exp
+expP = 
+  varP +++ trueP +++ falseP +++ intP  +++ primitiveAppP
+  +++ pairP +++ fstP +++ sndP
+  +++ ifP +++ letP +++ procP 
+  +++ appP
+
+intTyP :: ReadP Ty
+intTyP = symbolP "int" >> return IntTy
+
+boolTyP :: ReadP Ty
+boolTyP = symbolP "bool" >> return BoolTy
+
+funTyP :: ReadP Ty
+funTyP =
+  brackP $
+  do argtys <- listP ',' typeP
+     symbolP "->"
+     resty <- typeP
+     return $ FunTy argtys resty
+
+pairTyP :: ReadP Ty
+pairTyP =
+  do [s, t] <- tupleP typeP
+     return $ PairTy s t
+
+typeP :: ReadP Ty
+typeP =
+  intTyP +++ boolTyP +++ funTyP +++ pairTyP
+
+toEndP :: ReadP a -> ReadP a
+toEndP p =
+  do v <- p
+     skipSpaces
+     eof
+     return v
+
+programP :: ReadP [Exp]
+programP =
+  toEndP $ many expP
+
+parseWith :: ReadP a -> String -> a
+parseWith p s =
+  let result = readP_to_S p s in
+  if null result
+  then error "unparseable input"
+  else fst $ head  result
+
+parseFile :: String -> IO [Exp]
+parseFile fname =
+  do string <- readFile fname
+     let toParse = unlines $ filter notComment $ lines string
+           where notComment ('%':_) = False
+                 notComment _ = True
+     return $ parseWith programP toParse
+
+parse :: String -> Exp
+parse = parseWith $ toEndP expP 
+
+
+--
+-- Environments
+--
+
+data Frame =  Frame [Id] [EVal]
+            deriving (Eq, Show)
+                   
+data Env = EmptyEnv
+         | ExtendedEnv Frame Env
+         | RecExtendedEnv Frame Env
+           deriving (Eq, Show)
+
+emptyEnv :: Env         
+
+emptyEnv = EmptyEnv
+
+
+extendEnv :: [Id] -> [EVal] -> Env -> Env
+
+extendEnv ids vals = 
+  ExtendedEnv (Frame ids vals)
+
+extendEnvRec :: [Id] -> [EVal] -> Env -> Env
+extendEnvRec ids vals env =
+  RecExtendedEnv (Frame ids vals) env
+
+applyEnv :: Env -> Id -> EVal
+
+applyEnv EmptyEnv id =
+  error ("applyEnv: no binding for " ++ id)
+
+applyEnv (ExtendedEnv fr env) id =
+  case applyFrame fr id of
+    Nothing -> applyEnv env id
+    Just v  -> v
+
+applyEnv (RecExtendedEnv fr env) id =
+  case applyFrame fr id of
+    Nothing
+      -> applyEnv env id
+    Just (ProcVal parms body closureEnv)
+      -> ProcVal parms body (RecExtendedEnv fr env)
+
+applyFrame :: Frame -> Id -> Maybe EVal
+
+applyFrame (Frame (id':ids) (v:vs)) id =
+  if id'==id
+  then Just v
+  else applyFrame (Frame ids vs) id
+
+applyFrame (Frame _ _) id =
+  Nothing
+
